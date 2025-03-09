@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request, Form, Depends, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -9,12 +9,27 @@ import uuid
 from datetime import datetime
 import os
 import json
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="Paul - Interactive Assistant")
 
-# Set up Jinja2 templates - adjust path for Vercel
-templates = Jinja2Templates(directory="templates")
+# Set up Jinja2 templates - using relative path for Vercel
+# The templates directory should be at the root of your project
+templates_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+templates = Jinja2Templates(directory=templates_directory)
+
+# Mount static files - this may need adjustment for Vercel
+try:
+    static_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+    app.mount("/static", StaticFiles(directory=static_directory), name="static")
+    logger.info(f"Mounted static files from {static_directory}")
+except Exception as e:
+    logger.error(f"Failed to mount static files: {str(e)}")
 
 # Create a class for the request body
 class Query(BaseModel):
@@ -22,33 +37,44 @@ class Query(BaseModel):
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
 
-# For Vercel, we need to use a different approach for storing conversation history
-# Instead of in-memory storage, we'll simulate persistence with a file-based approach
-# (Note: In a production environment, you'd want to use a proper database)
+# In-memory storage for conversations as a fallback
+# This will be reset on each function invocation but is better than failing
+CONVERSATIONS = {}
 
 def get_conversations_file_path():
     # In Vercel's serverless environment, we need to use /tmp for any file operations
     return "/tmp/conversations.json"
 
 def load_conversations():
+    # Try to load from file first
     file_path = get_conversations_file_path()
-    if os.path.exists(file_path):
-        try:
+    try:
+        if os.path.exists(file_path):
             with open(file_path, 'r') as f:
                 return json.load(f)
-        except:
-            return {}
-    return {}
+    except Exception as e:
+        logger.error(f"Error loading conversations from file: {str(e)}")
+    
+    # Return in-memory conversations as fallback
+    return CONVERSATIONS
 
 def save_conversations(conversations):
-    file_path = get_conversations_file_path()
-    with open(file_path, 'w') as f:
-        json.dump(conversations, f)
+    # Update in-memory store
+    global CONVERSATIONS
+    CONVERSATIONS = conversations
+    
+    # Try to save to file
+    try:
+        file_path = get_conversations_file_path()
+        with open(file_path, 'w') as f:
+            json.dump(conversations, f)
+    except Exception as e:
+        logger.error(f"Error saving conversations to file: {str(e)}")
 
-# Groq API configuration
-GROQ_API_KEY = "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"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama3-70b-8192"  # You can adjust based on Groq's available models
+# Groq API configuration - use environment variables
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+GROQ_API_URL = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-70b-8192")
 
 # System prompt for Paul's personality
 SYSTEM_PROMPT = """
@@ -151,16 +177,18 @@ async def query_groq_api(user_query: str, conversation_id: str) -> str:
         "max_tokens": 300    # Limit token length to encourage brevity
     }
     
-    async with httpx.AsyncClient() as client:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(GROQ_API_URL, json=payload, headers=headers)
             response.raise_for_status()
             response_data = response.json()
             return response_data["choices"][0]["message"]["content"]
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"API error: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error querying API: {str(e)}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"API error: {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"API error: {e.response.text}")
+    except Exception as e:
+        logger.error(f"Error querying API: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error querying API: {str(e)}")
 
 # Route for the home page
 @app.get("/", response_class=HTMLResponse)
@@ -169,33 +197,67 @@ async def home(
     user_id: str = Depends(get_user_id),
     conversation_id: str = Depends(get_conversation_id)
 ):
-    # Get conversation history for display
-    history = get_conversation_history(conversation_id)
-    
-    response = templates.TemplateResponse(
-        "index.html", 
-        {
-            "request": request,
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "conversation_history": history,
-            "assistant_name": "Paul"
-        }
-    )
-    
-    # Set cookies if they don't exist
-    response.set_cookie(key="user_id", value=user_id, max_age=3600*24*30)
-    response.set_cookie(key="conversation_id", value=conversation_id, max_age=3600*24*7)
-    
-    return response
+    try:
+        # Get conversation history for display
+        history = get_conversation_history(conversation_id)
+        
+        response = templates.TemplateResponse(
+            "index.html", 
+            {
+                "request": request,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "conversation_history": history,
+                "assistant_name": "Paul"
+            }
+        )
+        
+        # Set cookies if they don't exist
+        response.set_cookie(key="user_id", value=user_id, max_age=3600*24*30)
+        response.set_cookie(key="conversation_id", value=conversation_id, max_age=3600*24*7)
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error in home route: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Error rendering home page - check template path and file existence"}
+        )
+
+# API endpoint for health check
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 # Static files handling for Vercel
 @app.get("/static/{file_path:path}")
 async def get_static(file_path: str):
-    # In Vercel, you typically can't serve static files this way
-    # You'll need to include static files in your deployment
-    # This is a placeholder and you might need a different approach
-    return {"error": "Static files route not implemented in serverless function"}
+    try:
+        # This is a fallback if app.mount doesn't work
+        static_directory = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+        file_full_path = os.path.join(static_directory, file_path)
+        
+        if os.path.exists(file_full_path):
+            with open(file_full_path, 'rb') as f:
+                content = f.read()
+            
+            # Determine content type (basic implementation)
+            content_type = "text/plain"
+            if file_path.endswith(".css"):
+                content_type = "text/css"
+            elif file_path.endswith(".js"):
+                content_type = "application/javascript"
+            elif file_path.endswith(".html"):
+                content_type = "text/html"
+            
+            return Response(content=content, media_type=content_type)
+    except Exception as e:
+        logger.error(f"Error serving static file {file_path}: {str(e)}")
+    
+    return JSONResponse(
+        status_code=404, 
+        content={"error": "File not found", "detail": f"Static file '{file_path}' not found"}
+    )
 
 # Start a new conversation
 @app.get("/new-conversation", response_class=HTMLResponse)
@@ -216,39 +278,46 @@ async def process_query(
     user_id: str = Depends(get_user_id),
     conversation_id: str = Depends(get_conversation_id)
 ):
-    query = query_request.query
-    
-    # Override IDs if provided in the request
-    if query_request.user_id:
-        user_id = query_request.user_id
-    if query_request.conversation_id:
-        conversation_id = query_request.conversation_id
-    
-    # Get conversation history
-    history = get_conversation_history(conversation_id)
-    
-    # Add query to conversation history
-    add_to_conversation_history(conversation_id, "user", query)
-    
-    # Get response from API with conversation history context
-    response_text = await query_groq_api(query, conversation_id)
-    
-    # Check if response is repetitive, if so, add instruction to vary response
-    attempts = 0
-    while is_repetitive(response_text, history) and attempts < 2:
-        # Try again with explicit instruction to vary the response
-        varied_query = f"{query} (Please provide a completely different response than before)"
-        response_text = await query_groq_api(varied_query, conversation_id)
-        attempts += 1
-    
-    # Add response to conversation history
-    add_to_conversation_history(conversation_id, "assistant", response_text)
-    
-    return {
-        "response": response_text,
-        "conversation_id": conversation_id,
-        "history": get_conversation_history(conversation_id)
-    }
+    try:
+        query = query_request.query
+        
+        # Override IDs if provided in the request
+        if query_request.user_id:
+            user_id = query_request.user_id
+        if query_request.conversation_id:
+            conversation_id = query_request.conversation_id
+        
+        # Get conversation history
+        history = get_conversation_history(conversation_id)
+        
+        # Add query to conversation history
+        add_to_conversation_history(conversation_id, "user", query)
+        
+        # Get response from API with conversation history context
+        response_text = await query_groq_api(query, conversation_id)
+        
+        # Check if response is repetitive, if so, add instruction to vary response
+        attempts = 0
+        while is_repetitive(response_text, history) and attempts < 2:
+            # Try again with explicit instruction to vary the response
+            varied_query = f"{query} (Please provide a completely different response than before)"
+            response_text = await query_groq_api(varied_query, conversation_id)
+            attempts += 1
+        
+        # Add response to conversation history
+        add_to_conversation_history(conversation_id, "assistant", response_text)
+        
+        return {
+            "response": response_text,
+            "conversation_id": conversation_id,
+            "history": get_conversation_history(conversation_id)
+        }
+    except Exception as e:
+        logger.error(f"Error in process_query: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Error processing query"}
+        )
 
 # API endpoint for form submission
 @app.post("/submit-query", response_class=HTMLResponse)
@@ -258,52 +327,86 @@ async def submit_query(
     user_id: str = Depends(get_user_id),
     conversation_id: str = Depends(get_conversation_id)
 ):
-    # Add query to conversation history
-    add_to_conversation_history(conversation_id, "user", query)
-    
-    # Get response from API
-    response_text = await query_groq_api(query, conversation_id)
-    
-    # Check if response is repetitive
-    history = get_conversation_history(conversation_id)
-    if is_repetitive(response_text, history):
-        # Try again with explicit instruction to vary
-        varied_query = f"{query} (Please provide a different response than before)"
-        response_text = await query_groq_api(varied_query, conversation_id)
-    
-    # Add response to conversation history
-    add_to_conversation_history(conversation_id, "assistant", response_text)
-    
-    response = templates.TemplateResponse(
-        "index.html", 
-        {
-            "request": request, 
-            "query": query, 
-            "response": response_text,
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "conversation_history": get_conversation_history(conversation_id),
-            "assistant_name": "Paul"
-        }
-    )
-    
-    # Set cookies
-    response.set_cookie(key="user_id", value=user_id, max_age=3600*24*30)
-    response.set_cookie(key="conversation_id", value=conversation_id, max_age=3600*24*7)
-    
-    return response
+    try:
+        # Add query to conversation history
+        add_to_conversation_history(conversation_id, "user", query)
+        
+        # Get response from API
+        response_text = await query_groq_api(query, conversation_id)
+        
+        # Check if response is repetitive
+        history = get_conversation_history(conversation_id)
+        if is_repetitive(response_text, history):
+            # Try again with explicit instruction to vary
+            varied_query = f"{query} (Please provide a different response than before)"
+            response_text = await query_groq_api(varied_query, conversation_id)
+        
+        # Add response to conversation history
+        add_to_conversation_history(conversation_id, "assistant", response_text)
+        
+        response = templates.TemplateResponse(
+            "index.html", 
+            {
+                "request": request, 
+                "query": query, 
+                "response": response_text,
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "conversation_history": get_conversation_history(conversation_id),
+                "assistant_name": "Paul"
+            }
+        )
+        
+        # Set cookies
+        response.set_cookie(key="user_id", value=user_id, max_age=3600*24*30)
+        response.set_cookie(key="conversation_id", value=conversation_id, max_age=3600*24*7)
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error in submit_query: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Error submitting query"}
+        )
 
 # Route to get conversation history
 @app.get("/conversation/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    history = get_conversation_history(conversation_id)
-    return {"conversation_id": conversation_id, "history": history}
+    try:
+        history = get_conversation_history(conversation_id)
+        return {"conversation_id": conversation_id, "history": history}
+    except Exception as e:
+        logger.error(f"Error in get_conversation: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Error retrieving conversation history"}
+        )
 
 # Route to clear conversation history
 @app.get("/clear-history")
 async def clear_history(conversation_id: str = Depends(get_conversation_id)):
-    conversations = load_conversations()
-    if conversation_id in conversations:
-        del conversations[conversation_id]
-        save_conversations(conversations)
-    return {"status": "success", "message": "Conversation history cleared"}
+    try:
+        conversations = load_conversations()
+        if conversation_id in conversations:
+            del conversations[conversation_id]
+            save_conversations(conversations)
+        return {"status": "success", "message": "Conversation history cleared"}
+    except Exception as e:
+        logger.error(f"Error in clear_history: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "detail": "Error clearing conversation history"}
+        )
+
+# For Vercel serverless functions
+# This is necessary for Vercel to correctly handle the FastAPI app
+from fastapi.middleware.cors import CORSMiddleware
+
+# Add CORS middleware to allow requests from any origin during development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
